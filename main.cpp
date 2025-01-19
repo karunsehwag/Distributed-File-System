@@ -6,6 +6,11 @@
 #include <cstring>
 #include <map>
 #include <sys/stat.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+
+
 
 #define CHUNK_SIZE 32
 #define REPLICATION_FACTOR 3
@@ -60,15 +65,31 @@ map<string, vector<int>> distributeChunks(const vector<string> &chunks, int numN
     return metadata;
 }
 
-// Function for storage nodes to store the received chunk
 void storeChunk(const string &chunkId, const string &chunkData, int rank) {
-    string fileName = "node_" + to_string(rank) + "_" + chunkId + ".bin";
+    // Define the directory path where the files will be stored
+    string directory = "chunks";
+    
+    // Check if the directory exists, and create it if it doesn't
+    struct stat info;
+    if (stat(directory.c_str(), &info) != 0) {
+        if (mkdir(directory.c_str(), 0777) != 0) {
+            cerr << "Error: Could not create directory!" << endl;
+            return;
+        }
+        cout << "Directory created: " << directory << endl;
+    }
+
+    // Create the file path with the chunk ID and rank
+    string fileName = directory + "/node_" + to_string(rank) + "_" + chunkId + ".bin";
+    
+    // Open the file for writing in binary mode
     ofstream file(fileName, ios::binary);
 
     if (file) {
+        // Write the chunk data to the file
         file.write(chunkData.c_str(), chunkData.size());
         file.close();
-        cout << "Rank " << rank << " stored " << chunkId << "." << endl;
+        cout << "Rank " << rank << " stored " << chunkId << " at " << fileName << "." << endl;
     } else {
         cerr << "Error: Could not store chunk at Rank " << rank << endl;
     }
