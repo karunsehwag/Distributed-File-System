@@ -4,7 +4,9 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <chrono>
 #include <map>
+#include <algorithm>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -18,8 +20,8 @@ void retrieveAndSendChunk(int rank, const string &chunkId)
 {
     // Construct the file name from chunkId
     string fileName = "chunks/node_" + to_string(rank) + "_" + chunkId + ".bin";
+    cout<<"fileName "<<fileName<<endl;
     ifstream chunkFile(fileName.c_str(), ios::in | ios::binary);
-    cout<<fileName<<endl;
     if (chunkFile.is_open())
     {
         // Read the chunk data
@@ -28,11 +30,8 @@ void retrieveAndSendChunk(int rank, const string &chunkId)
 
         // Ensure null-termination
         chunkDataBuffer[chunkFile.gcount()] = '\0';
-
-        // Send the chunk data back to Rank 0
+        chunkFile.close();
         MPI_Send(chunkDataBuffer, CHUNK_SIZE + 1, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
-        cout<<chunkDataBuffer<<endl;
-        cout << "Node " << rank << " sending chunk: " << chunkId << " to Rank 0." << endl;
     }
     else
     {
@@ -143,53 +142,93 @@ void printMetadata(const map<string, vector<int>> &metadata)
         cout << endl;
     }
 }
+
+
+
 void retrieveFile(const string &fileName, const map<string, vector<int>> &fileChunks, int rank)
 {
     if (rank != 0)
     {
-        cout << "other ";
         cerr << "Error: Only Rank 0 can retrieve files." << endl;
         return;
     }
-    vector<string> reassembledChunks(fileChunks.size(), "");
 
-    cout << "Rank 0: Retrieving file " << endl;
+    vector<string> reassembledChunks(fileChunks.size(), "");
+    cout << "Rank 0: Retrieving file " << fileName << endl;
+
     // Loop through each chunk in the file
     for (const auto &[chunkId, nodes] : fileChunks)
     {
         bool chunkRetrieved = false;
-        // Try retrieving the chunk from each replica node
-        for (const int &targetNode : nodes)
+        MPI_Request requests[nodes.size() * 2];  // Requests for MPI_Isend and MPI_Irecv
+        MPI_Status statuses[nodes.size()];  // To hold statuses for MPI_Irecv
+        char chunkData[CHUNK_SIZE + 1] = {0};  // Buffer to hold the chunk data
+        vector<int> completedNodes;  // To keep track of which nodes have responded
+
+        // Send requests to all nodes
+        for (size_t i = 0; i < nodes.size(); ++i)
         {
-            // Sending retrieval request to the target node
-            MPI_Send("retrieve", strlen("retrieve") + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD);
-            MPI_Send(chunkId.c_str(), chunkId.size() + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD);
-            char chunkData[CHUNK_SIZE + 1] = {0}; // Ensure buffer is large enough
-            MPI_Status status;
-            MPI_Recv(chunkData, CHUNK_SIZE + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &status);
+            int targetNode = nodes[i];
+            MPI_Isend("retrieve", strlen("retrieve") + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2]);
+            MPI_Isend(chunkId.c_str(), chunkId.size() + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2 + 1]);
+        }
 
-            // Log chunk data received from the node
-            cout << "Rank 0: Received chunk data from Node " << targetNode << " for " << chunkId << ": " << chunkData << endl;
+        // Non-blocking receive for each node
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            int targetNode = nodes[i];
+            MPI_Irecv(chunkData, CHUNK_SIZE + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i + nodes.size()]);
+        }
 
-            // Validate and check if chunk data was received
-            if (strlen(chunkData) > 0)
-            {
-                // Extract the chunk index from chunkId
-                size_t underscorePos = chunkId.find_last_of('_');
-                if (underscorePos != string::npos)
-                {
-                    int chunkIndex = stoi(chunkId.substr(underscorePos + 1));
-                    if (chunkIndex < reassembledChunks.size())
+        // Timeout check (1 second)
+        auto startTime = chrono::steady_clock::now();
+        cout<<"comiing here" <<endl;
+        while (!chunkRetrieved)
+        {    cout<<"comiing here tooo"    <<chunkData<<endl;
+            // Check for completion of any of the receives
+            for (size_t i = 0; i < nodes.size(); ++i)
+            {   
+                int flag = 0;
+                MPI_Test(&requests[i + nodes.size()], &flag, &statuses[i]);
+                 cout<<"comiing here tyyyyyyyyyyytooo"    <<chunkData<<endl;
+                if (flag && find(completedNodes.begin(), completedNodes.end(), nodes[i]) == completedNodes.end())  // Check if this node has not already responded
+                {    cout<<"ia m here "<<endl;
+                    // Process the chunk data
+                    if (strlen(chunkData) > 0)
                     {
-                        reassembledChunks[chunkIndex] = string(chunkData);
-                        chunkRetrieved = true;
-                        break; // Stop trying other nodes once the chunk is retrieved
+                       cout << "Rank 0: Received chunk data from Node " << nodes[i] << " for " << chunkId<< endl;
+
+                        // Extract the chunk index from chunkId
+                        size_t underscorePos = chunkId.find_last_of('_');
+                        if (underscorePos != string::npos)
+                        {
+                            int chunkIndex = stoi(chunkId.substr(underscorePos + 1));
+                            if (chunkIndex < reassembledChunks.size())
+                            {
+                                reassembledChunks[chunkIndex] = string(chunkData);
+                                chunkRetrieved = true;
+                                completedNodes.push_back(nodes[i]);  // Mark node as completed
+                                break;  // Stop trying other nodes once the chunk is retrieved
+                            }
+                        }
                     }
                 }
             }
+
+            // Check if timeout has occurred (1 second in this case)
+            auto currentTime = chrono::steady_clock::now();
+            double elapsedTime = chrono::duration<double>(currentTime - startTime).count();
+
+            
+
+            if (elapsedTime >= 2.0)
+            {   cout << "Elapsed Time: " << elapsedTime << " seconds" << endl;
+                cerr << "Error: Timeout occurred, no response from nodes within 2 seconds for chunk: " << chunkId << endl;
+                break;
+            }
         }
 
-        // If a chunk could not be retrieved, return an error and exit
+        // If a chunk could not be retrieved from any node, return an error and exit
         if (!chunkRetrieved)
         {
             cerr << "Error: Could not retrieve chunk \"" << chunkId << "\" from any replica." << endl;
@@ -211,9 +250,9 @@ void retrieveFile(const string &fileName, const map<string, vector<int>> &fileCh
 
     // Display the reassembled file content
     cout << "Rank 0: Successfully retrieved and reassembled the file \"" << fileName << "\"." << endl;
-    cout << "File Content:\n"
-         << fileContent << endl;
+    cout << "File Content:\n" << fileContent << endl;
 }
+
 
 int main(int argc, char *argv[])
 {
@@ -395,7 +434,7 @@ int main(int argc, char *argv[])
             MPI_Status status;
             MPI_Recv(commandBuffer, 100, MPI_CHAR, 0, 0, MPI_COMM_WORLD, &status);
             string command(commandBuffer);
-            cout << "command " << command << endl;
+           // cout << "command " << command << endl;
             if (command == "exit")
             {
                 cout << "Rank " << rank << ": Terminating..." << endl;
@@ -419,7 +458,6 @@ int main(int argc, char *argv[])
                 MPI_Recv(chunkIdBuffer, 100, MPI_CHAR, 0, 0, MPI_COMM_WORLD, &status);
                 string chunkId(chunkIdBuffer);
                 retrieveAndSendChunk(rank, chunkId);
-                cout << "Node " << rank << " sending chunk: " << chunkId << " to Rank 0." << endl;
             }
         }
     }
