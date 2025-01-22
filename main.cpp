@@ -137,123 +137,107 @@ void printMetadata(const map<string, vector<int>> &metadata)
 
 void retrieveFile(const string &fileName, const map<string, vector<int>> &fileChunks, int rank)
 {
-   if (rank != 0)
-   {
-       cerr << "Error: Only Rank 0 can retrieve files." << endl;
-       return;
-   }
+    if (rank != 0)
+    {
+        cerr << "Error: Only Rank 0 can retrieve files." << endl;
+        return;
+    }
 
+    vector<string> reassembledChunks(fileChunks.size(), "");
+    cout << "Rank 0: Retrieving file " << fileName << endl;
 
-   vector<string> reassembledChunks(fileChunks.size(), "");
-   cout << "Rank 0: Retrieving file " << fileName << endl;
+    // Loop through each chunk in the file
+    for (const auto &[chunkId, nodes] : fileChunks)
+    {
+        bool chunkRetrieved = false;
+        int retryCount = 0;  // Counter to track retry attempts
+        MPI_Request requests[nodes.size() * 2];  // Requests for MPI_Isend and MPI_Irecv
+        MPI_Status statuses[nodes.size()];  // To hold statuses for MPI_Irecv
+        char chunkData[CHUNK_SIZE + 1] = {0};  // Buffer to hold the chunk data
+        vector<int> completedNodes;  // To keep track of which nodes have responded
 
+        // Send requests to all nodes
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            int targetNode = nodes[i];
+            MPI_Isend("retrieve", strlen("retrieve") + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2]);
+            MPI_Isend(chunkId.c_str(), chunkId.size() + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2 + 1]);
+        }
 
-   // Loop through each chunk in the file
-   for (const auto &[chunkId, nodes] : fileChunks)
-   {
-       bool chunkRetrieved = false;
-       MPI_Request requests[nodes.size() * 2];  // Requests for MPI_Isend and MPI_Irecv
-       MPI_Status statuses[nodes.size()];  // To hold statuses for MPI_Irecv
-       char chunkData[CHUNK_SIZE + 1] = {0};  // Buffer to hold the chunk data
-       vector<int> completedNodes;  // To keep track of which nodes have responded
+        // Non-blocking receive for each node
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            int targetNode = nodes[i];
+            MPI_Irecv(chunkData, CHUNK_SIZE + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i + nodes.size()]);
+        }
 
+        // Retry logic
+        while (!chunkRetrieved && retryCount < 3)
+        {
+            // Check for completion of any of the receives
+            for (size_t i = 0; i < nodes.size(); ++i)
+            {
+                int flag = 0;
+                MPI_Test(&requests[i + nodes.size()], &flag, &statuses[i]);
+                if (flag && find(completedNodes.begin(), completedNodes.end(), nodes[i]) == completedNodes.end())  // Check if this node has not already responded
+                {
+                    // Process the chunk data
+                    if (strlen(chunkData) > 0)
+                    {
+                        cout << "Rank 0: Received chunk data from Node " << nodes[i] << " for " << chunkId << endl;
 
-       // Send requests to all nodes
-       for (size_t i = 0; i < nodes.size(); ++i)
-       {
-           int targetNode = nodes[i];
-           MPI_Isend("retrieve", strlen("retrieve") + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2]);
-           MPI_Isend(chunkId.c_str(), chunkId.size() + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i * 2 + 1]);
-       }
+                        // Extract the chunk index from chunkId
+                        size_t underscorePos = chunkId.find_last_of('_');
+                        if (underscorePos != string::npos)
+                        {
+                            int chunkIndex = stoi(chunkId.substr(underscorePos + 1));
+                            if (chunkIndex < reassembledChunks.size())
+                            {
+                                reassembledChunks[chunkIndex] = string(chunkData);
+                                chunkRetrieved = true;
+                                completedNodes.push_back(nodes[i]);  // Mark node as completed
+                                break;  // Stop trying other nodes once the chunk is retrieved
+                            }
+                        }
+                    }
+                }
+            }
 
+            if (!chunkRetrieved)
+            {
+                retryCount++;
+                if (retryCount < 3)
+                {
+                    cout << "Retrying (" << retryCount << "/3) to retrieve chunk: " << chunkId << endl;
+                }
+            }
+        }
 
-       // Non-blocking receive for each node
-       for (size_t i = 0; i < nodes.size(); ++i)
-       {
-           int targetNode = nodes[i];
-           MPI_Irecv(chunkData, CHUNK_SIZE + 1, MPI_CHAR, targetNode, 0, MPI_COMM_WORLD, &requests[i + nodes.size()]);
-       }
+        // If a chunk could not be retrieved from any node after 3 retries, return an error and exit
+        if (!chunkRetrieved)
+        {
+            cerr << "Error: Could not retrieve chunk \"" << chunkId << "\" from any replica after 3 attempts." << endl;
+            return;
+        }
+    }
 
+    // Combine the chunks into the original file content
+    string fileContent;
+    for (const auto &chunk : reassembledChunks)
+    {
+        if (chunk.empty())
+        {
+            cerr << "Error: Missing chunk during reassembly." << endl;
+            return;
+        }
+        fileContent += chunk;
+    }
 
-       // Timeout check (1 second)
-       auto startTime = chrono::steady_clock::now();
-       cout<<"comiing here" <<endl;
-       while (!chunkRetrieved)
-       {    cout<<"comiing here tooo"    <<chunkData<<endl;
-           // Check for completion of any of the receives
-           for (size_t i = 0; i < nodes.size(); ++i)
-           {  
-               int flag = 0;
-               MPI_Test(&requests[i + nodes.size()], &flag, &statuses[i]);
-                cout<<"comiing here tyyyyyyyyyyytooo"    <<chunkData<<endl;
-               if (flag && find(completedNodes.begin(), completedNodes.end(), nodes[i]) == completedNodes.end())  // Check if this node has not already responded
-               {    cout<<"ia m here "<<endl;
-                   // Process the chunk data
-                   if (strlen(chunkData) > 0)
-                   {
-                      cout << "Rank 0: Received chunk data from Node " << nodes[i] << " for " << chunkId<< endl;
-
-
-                       // Extract the chunk index from chunkId
-                       size_t underscorePos = chunkId.find_last_of('_');
-                       if (underscorePos != string::npos)
-                       {
-                           int chunkIndex = stoi(chunkId.substr(underscorePos + 1));
-                           if (chunkIndex < reassembledChunks.size())
-                           {
-                               reassembledChunks[chunkIndex] = string(chunkData);
-                               chunkRetrieved = true;
-                               completedNodes.push_back(nodes[i]);  // Mark node as completed
-                               break;  // Stop trying other nodes once the chunk is retrieved
-                           }
-                       }
-                   }
-               }
-           }
-
-
-           // Check if timeout has occurred (1 second in this case)
-           auto currentTime = chrono::steady_clock::now();
-           double elapsedTime = chrono::duration<double>(currentTime - startTime).count();
-
-
-          
-
-
-           if (elapsedTime >= 2.0)
-           {   cout << "Elapsed Time: " << elapsedTime << " seconds" << endl;
-               cerr << "Error: Timeout occurred, no response from nodes within 2 seconds for chunk: " << chunkId << endl;
-               break;
-           }
-       }
-
-
-       // If a chunk could not be retrieved from any node, return an error and exit
-       if (!chunkRetrieved)
-       {
-           cerr << "Error: Could not retrieve chunk \"" << chunkId << "\" from any replica." << endl;
-           return;
-       }
-   }
-
-
-   // Combine the chunks into the original file content
-   string fileContent;
-   for (const auto &chunk : reassembledChunks)
-   {
-       if (chunk.empty())
-       {
-           cerr << "Error: Missing chunk during reassembly." << endl;
-           return;
-       }
-       fileContent += chunk;
-   }
-
-
-   // Display the reassembled file content
-   cout << "Rank 0: Successfully retrieved and reassembled the file \"" << fileName << "\"." << endl;
-   cout << "File Content:\n" << fileContent << endl;
+    // Display the reassembled file content
+    cout << "Rank 0: Successfully retrieved and reassembled the file \"" << fileName << "\"." << endl;
+    cout << "File Content:\n" << fileContent << endl;
 }
+
 
 
 
