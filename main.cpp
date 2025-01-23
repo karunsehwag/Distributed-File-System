@@ -10,6 +10,13 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <vector>
+#include <ctime>
+#include <mutex>
 
 #define CHUNK_SIZE 32
 #define REPLICATION_FACTOR 3
@@ -20,7 +27,12 @@ unordered_map<string, string> chunkDataMap;
 unordered_map<int, vector<string>> nodeDataMap;
 vector<bool> nodestatus(10, true);
 set<int> activenodes;
-
+const int heartbeatInterval = 1; // Heartbeat interval in seconds
+atomic<bool> CHECK(true);
+map<int, bool> heartbeats;          // Stores heartbeat status of each rank
+map<int, time_t> lastHeartbeatTime; // Stores last heartbeat time for each rank
+mutex heartbeatMutex;               // Mutex for synchronizing heartbeats access
+const int failoverTimeout = 3;      // Timeout for failover (in seconds)
 // Function to retrieve and send the chunk data
 void retrieveAndSendChunk(int rank, const string &chunkId)
 {
@@ -246,7 +258,64 @@ void retrieveFile(const string &fileName, const map<string, vector<int>> &fileCh
          << fileContent << endl;
 }
 
-bool CHECK=true;
+void monitorHeartbeats(int rank, int size)
+{
+    while (true)
+    {
+        MPI_Status status;
+        char commandBuffer[100];
+        MPI_Recv(commandBuffer, 100, MPI_CHAR, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+
+        string command(commandBuffer);
+        if (command == "heartbeat")
+        {
+            int senderRank = status.MPI_SOURCE;
+            activenodes.insert(node);
+            lock_guard<mutex> lock(heartbeatMutex);  // Lock to ensure thread-safe access to heartbeats map
+            lastHeartbeatTime[senderRank] = time(0); // Update last heartbeat time for the sender
+            heartbeats[senderRank] = true;           // Mark the node as having sent a heartbeat
+        }
+        else if (command == "exit")
+        {
+            break;
+        }
+    }
+}
+
+// Function to check for failed nodes (failover)
+void failoverCheck(int size)
+{
+    while (true)
+    {
+        time_t currentTime = time(0);
+
+        for (int i = 1; i < size; ++i)
+        {
+            lock_guard<mutex> lock(heartbeatMutex); // Lock to ensure thread-safe access to heartbeats map
+            if (heartbeats[i] && difftime(currentTime, lastHeartbeatTime[i]) > failoverTimeout)
+            {
+                heartbeats[i] = false; // Mark node as failed
+                activenodes.erase(node); // Remove the node from the active nodes set
+                cout << "Node " << i << " has failed to send heartbeat in the last " << failoverTimeout << " seconds." << endl;
+                // Implement failover action here (e.g., reassign tasks)
+            }
+        }
+
+        this_thread::sleep_for(chrono::seconds(1)); // Check every second
+    }
+}
+void sendHeartbeat(int rank)
+{
+    while (true)
+    {
+        if (CHECK) // Ensure that the node is active (not in failover state)
+        {
+            MPI_Send("heartbeat", 9, MPI_CHAR, 0, 0, MPI_COMM_WORLD); // Send heartbeat to rank 0
+           // cout << "Rank " << rank << ": Heartbeat sent." << endl;
+        }
+        this_thread::sleep_for(chrono::seconds(1)); // Sleep for 1 second
+    }
+}
 int main(int argc, char *argv[])
 {
     MPI_Init(&argc, &argv);
@@ -269,10 +338,21 @@ int main(int argc, char *argv[])
     {
         // Rank 0 handles the file upload command in a loop
         map<string, map<string, vector<int>>> mdata;
-        for(int i=1;i<size;i++)
+        for (int i = 1; i < size; i++)
         {
             activenodes.insert(i);
         }
+        for (int i = 1; i < size; ++i)
+        {
+            heartbeats[i] = false;
+            lastHeartbeatTime[i] = time(0);
+        }
+        thread heartbeatMonitor(monitorHeartbeats, rank, size); // Start heartbeat monitoring
+        thread failoverThread(failoverCheck, size);             // Start failover checking thread
+
+        heartbeatMonitor.detach();
+        failoverThread.detach();
+
         while (true)
         {
             string command;
@@ -382,8 +462,8 @@ int main(int argc, char *argv[])
                     cerr << "Rank 0: Invalid node number!" << endl;
                     continue;
                 }
-                activenodes.erase(node);
-                MPI_Send("failover", 8, MPI_CHAR, node, 0, MPI_COMM_WORLD);
+                
+                MPI_Send("failover", 9, MPI_CHAR, node, 0, MPI_COMM_WORLD);
             }
             else if (command.rfind("recover", 0) == 0)
             {
@@ -393,7 +473,7 @@ int main(int argc, char *argv[])
                     cerr << "Rank 0: Invalid node number!" << endl;
                     continue;
                 }
-                activenodes.insert(node);
+                
                 MPI_Send("recover", 8, MPI_CHAR, node, 0, MPI_COMM_WORLD);
             }
             else
@@ -404,6 +484,8 @@ int main(int argc, char *argv[])
     }
     else
     {
+        thread heartbeatSender(sendHeartbeat, rank); // Start heartbeat sending
+        heartbeatSender.detach();
         while (true)
         {
             char commandBuffer[100];
