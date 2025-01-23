@@ -18,6 +18,7 @@
 using namespace std;
 
 unordered_map<string, string> chunkDataMap;
+unordered_map<int,vector<string>> nodeDataMap;
 // Function to retrieve and send the chunk data
 void retrieveAndSendChunk(int rank, const string &chunkId)
 {
@@ -76,30 +77,47 @@ vector<string> partitionFile(const string &filePath)
 // Function to distribute chunks across nodes with replication
 map<string, vector<int>> distributeChunks(const vector<string> &chunks, int numNodes, const string &fileName)
 {
-   map<string, vector<int>> metadata;
+    map<string, vector<int>> metadata;
 
+    for (size_t i = 0; i < chunks.size(); ++i)
+    {
+        vector<int> replicas;
+        string chunkId = fileName + "_Chunk_" + to_string(i);
 
-   for (size_t i = 0; i < chunks.size(); ++i)
-   {
-       vector<int> replicas;
+        // Distribute replicas to nodes with the least chunks
+        for (int r = 0; r < REPLICATION_FACTOR; ++r)
+        {
+            int leastLoadedNode = -1;
+            size_t minLoad = SIZE_MAX;
 
+            // Find the node with the least number of assigned chunks that hasn't been assigned this chunk yet
+            for (int node = 1; node <= numNodes; ++node)
+            {
+                if (find(replicas.begin(), replicas.end(), node) == replicas.end())
+                {
+                    size_t currentLoad = nodeDataMap[node].size(); // Count chunks assigned to this node
+                    if (currentLoad < minLoad)
+                    {
+                        leastLoadedNode = node;
+                        minLoad = currentLoad;
+                    }
+                }
+            }
 
-       // Distribute replicas to distinct nodes using modulo arithmetic
-       for (int r = 0; r < REPLICATION_FACTOR; ++r)
-       {
-           int node = (i + r) % numNodes + 1; // Nodes are from 1 to N-1
-           replicas.push_back(node);
-       }
+            // Assign the chunk to the least loaded node
+            if (leastLoadedNode != -1)
+            {
+                replicas.push_back(leastLoadedNode);
+                nodeDataMap[leastLoadedNode].push_back(chunkId);
+            }
+        }
 
+        metadata[chunkId] = replicas;
+    }
 
-       // Create unique chunk ID with filename prefix
-       string chunkId = fileName + "_Chunk_" + to_string(i);
-       metadata[chunkId] = replicas;
-   }
-
-
-   return metadata;
+    return metadata;
 }
+
 
 
 void storeChunk(const std::string &chunkId, const std::string &chunkData, int rank)
@@ -108,7 +126,7 @@ void storeChunk(const std::string &chunkId, const std::string &chunkData, int ra
     chunkDataMap[chunkId] = chunkData;
 
     // Log the storage operation
-    std::cout << "Rank " << rank << " stored " << chunkId << " in memory." << std::endl;
+    std::cout << "Rank " << rank << " stored " << chunkId <<" in memory." << std::endl;
 }
 
 
